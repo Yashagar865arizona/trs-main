@@ -23,18 +23,9 @@ class TarsTextHandler:
         self.ltm.load_from_disk(index_file, mapping_file)
         self.conversations_path = "conversations"
 
-    def is_scheduling_command(self, message):
-        # Define a regex pattern that matches your expected scheduling command format
-        pattern = r"Schedule '(.+?)' to (\+\d+) at ([\d-]+\s[\d:]+)"
-        return re.match(pattern, message) is not None
 
-    def schedule_text(self, send_time, to_number, message):
-        scheduler.add_job(self.send_text, 'date', run_date=send_time, args=[to_number, message])
 
-    def send_text(self, to_number, message):
-        message = self.client.messages.create(body=message, from_=self.phone_number, to=to_number)
-        
-        return message.sid
+    
 
     def handle_incoming_text(self, from_number, message_body, caller_name):
         prompt_messages = [
@@ -49,8 +40,8 @@ class TarsTextHandler:
         reformatted_command = gpt_response.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
 
 
+        print(reformatted_command)
         
-
         # Check if GPT has reformatted it into a scheduling command
         if self.is_scheduling_command(reformatted_command):
             # Extract scheduling details (assuming GPT reformatted it into an easy-to-parse format)
@@ -105,17 +96,7 @@ class TarsTextHandler:
         return response_content
             
 
-    def reformat_scheduling_request(self, message_body):
-        # Example GPT prompt to reformat the message
-        prompt = f"Reformat this into a scheduling command: '{message_body}'"
-        
-        # Send the prompt to GPT and get the response (implement this based on your GPT setup)
-        gpt_response = self.gpt.generate_response(prompt)
-
-        # Assuming the response is in the format you expect
-        reformatted_command = gpt_response.get('choices', [{}])[0].get('text', '').strip()
-
-        return reformatted_command
+    
 
     def get_or_create_conversation_file(self, phone_number):
         file_path = os.path.join(self.conversations_path, f"{phone_number}.json")
@@ -155,6 +136,33 @@ class TarsTextHandler:
 
         # Return None or raise an exception if the command doesn't match the expected format
         return None
+    
+
+    def is_scheduling_command(self, message):
+        # Define a regex pattern that matches your expected scheduling command format
+        if 'Schedule' in message:
+            return True
+        return False
+
+    def schedule_text(self, send_time, to_number, message):
+        scheduler.add_job(self.send_text, 'date', run_date=send_time, args=[to_number, message])
+    
+    def reformat_scheduling_request(self, message_body):
+        # Example GPT prompt to reformat the message
+        prompt = f"Reformat this into a scheduling command: '{message_body}'"
+        
+        # Send the prompt to GPT and get the response (implement this based on your GPT setup)
+        gpt_response = self.gpt.generate_response(prompt)
+
+        # Assuming the response is in the format you expect
+        reformatted_command = gpt_response.get('choices', [{}])[0].get('text', '').strip()
+
+        return reformatted_command
+    
+    def send_text(self, to_number, message):
+        message = self.client.messages.create(body=message, from_=self.phone_number, to=to_number)
+        
+        return message.sid
 
 
 
@@ -168,15 +176,15 @@ from flask import Flask, request
 
 
 
-openapi_key = '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'  
+openapi_key = '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'  
 openai_client = openai.OpenAI(api_key= openapi_key)
 ltm = LTM(api_key=openapi_key)
 
 
 twilio_account_sid = 'AC7e64afea019cf2e9706eea56aab5d143'
-twilio_auth_token = '93a108eb7ec3a21329021f0602fcacc7'  
+twilio_auth_token = 'ee22c1ab96e9a3c01ed2aa1faf0a8284'  
 phone_number = '8557520721'  
-openai_api_key = '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'  
+openai_api_key = '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'  
 tars_handler = TarsTextHandler(
     twilio_account_sid=twilio_account_sid,
     twilio_auth_token=twilio_auth_token,
