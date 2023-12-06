@@ -1,0 +1,18 @@
+#Most Up to date
+
+numpy
+requests
+opencv-python
+SpeechRecognition
+pyscreenshot
+mss
+openai
+elevenlabs
+faiss-cpu
+face_recognition
+soundfile
+sounddevice
+ibm-watson
+ibm-cloud-sdk-core
+pygame
+pillow

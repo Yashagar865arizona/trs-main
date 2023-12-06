@@ -1,0 +1,1262 @@
+"""
+Okay, so we need to develop a new class that integrates texting capabilities
+ with Twilio. Specifically, it should work with the same phone number we're 
+ currently using. For instance, when TARS interacts with a person over a call, 
+ the details of that interaction need to be saved, which is already happening. 
+ This information needs to be stored in a file linked to the individual's phone 
+ number. This way, if there's a callback, we can reference this file to recall 
+ the context and history of the interaction. Additionally, there's a vector database 
+ linked to each phone number, for which classes will be created. The task at hand is 
+ to generate a unique file for every new number that is called, attaching a specific 
+ vector space to it, rather than using a single general file. In this file, we will 
+ also store crucial details about the person, such as their name and a summary of key 
+ information. There will be another file to log the dialogue history up to the present. 
+ This system will apply to both calls and texts. For texts, the system will seamlessly 
+ continue the conversation from where the last call ended, as if the call is still ongoing, 
+ but in text form. TARS will request consent from the individual for autonomous texting and 
+ calling, enabling it to resume conversations. This process can be initiated either randomly 
+ or at a specific time requested by the user, thus making it automated. We will also implement 
+ an account-based system to track and schedule when to initiate contact with the user again
+"""
+
+
+from ibm_watson.websocket import RecognizeCallback, AudioSource
+from ibm_watson import SpeechToTextV1
+from ibm_cloud_sdk_core.authenticators import IAMAuthenticator
+import sys
+import wave
+import soundfile as sf
+from twilio.twiml.voice_response import VoiceResponse, Record, Start, Connect, Say, Stream, Pause
+
+import audioop
+from scipy.io.wavfile import write
+import websockets
+import asyncio
+from contextlib import contextmanager
+from whisper import transcribe
+import os
+import openai
+from twilio.rest import Client
+from flask import Flask, request, send_file, session, make_response, jsonify, send_from_directory
+import re
+import requests
+import base64
+import io
+import json
+import time
+from pydub import AudioSegment
+import random
+import subprocess
+import tempfile
+import ffmpeg
+import cachetools
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+import threading
+import secrets
+import signal
+import numpy as np
+from io import BytesIO
+from threading import Thread
+
+
+# others.
+
+from flask_ngrok import run_with_ngrok  # You might need to install flask-ngrok
+from twilio.twiml.voice_response import VoiceResponse
+
+from flask_sockets import Sockets
+
+from gevent import pywsgi
+from geventwebsocket.handler import WebSocketHandler
+import logging
+
+from flask import Flask, request
+
+import audioop
+import base64
+import json
+import os
+from flask import Flask, request
+from flask_sock import Sock, ConnectionClosed
+from twilio.twiml.voice_response import VoiceResponse, Start
+from twilio.rest import Client
+import vosk
+
+
+from flask import Flask, request, jsonify
+from twilio.twiml.voice_response import VoiceResponse, Start
+from flask_socketio import SocketIO, emit
+import os
+import base64
+import audioop
+import json
+import whisper
+import io
+from tempfile import NamedTemporaryFile
+import scipy.signal
+import io
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# IBM Watson Credentials
+IBM_API_KEY = "6qj4OYNJQ9dP5KvTy6DYKeY11E6QwIbC5MYdQrp4WYT3"
+IBM_URL = "https://api.au-syd.speech-to-text.watson.cloud.ibm.com/instances/a060b1a1-8b30-4191-b335-095ddbf0c1ad"
+
+
+class MyRecognizeCallback(RecognizeCallback):
+    def __init__(self, transcription_file):
+        RecognizeCallback.__init__(self)
+        self.transcription_file = transcription_file
+
+    def on_transcription(self, transcript):
+        with open(self.transcription_file, "a") as file:
+            for result in transcript['results']:
+                if result['final']:
+                    transcript_text = result['alternatives'][0]['transcript']
+                    file.write(transcript_text + "\n")
+        print(transcript)
+
+    def on_connected(self):
+        print('Connection was successful')
+
+    def on_error(self, error):
+        print('Error received: {}'.format(error))
+
+    def on_inactivity_timeout(self, error):
+        print('Inactivity timeout: {}'.format(error))
+
+    def on_close(self):
+        print("Connection closed")
+
+
+# Initialize IBM Watson Speech to Text
+authenticator = IAMAuthenticator(IBM_API_KEY)
+speech_to_text = SpeechToTextV1(authenticator=authenticator)
+speech_to_text.set_service_url(IBM_URL)
+
+transcription_file = "transcriptions.txt"
+# This callback object will handle the transcription
+mycallback = MyRecognizeCallback(transcription_file)
+
+
+def get_ngrok_url():
+    """Return the public URL provided by ngrok."""
+    try:
+        response = requests.get("http://localhost:4040/api/tunnels")
+        tunnels = response.json()['tunnels']
+        for tunnel in tunnels:
+            # Assuming you want the https URL, change to 'http' if you want the http one
+            if tunnel['proto'] == 'https':
+                return tunnel['public_url']
+    except requests.ConnectionError:
+        print("Failed to connect to the ngrok API")
+        return None
+
+
+app = Flask(__name__)
+sockets = Sockets(app)
+app.secret_key = secrets.token_hex(16)
+
+# socketIO
+
+sock = Sock(app)
+
+
+CL = '\x1b[0K'
+BS = '\x08'
+
+
+# Create a cache with a maximum size of 100 items
+cache = cachetools.LRUCache(maxsize=100)
+
+account_sid = "AC7e64afea019cf2e9706eea56aab5d143"
+auth_token = "93a108eb7ec3a21329021f0602fcacc7"
+twilio_number = "8557520721"
+xi_api_key = "bfdf947c36d2b7c1a8bc08cd301c1f8c"
+
+
+client = Client(account_sid, auth_token)
+
+openai.api_key = "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"
+identity = "TARS"
+phone_number = None
+caller_name = "User"
+response_ready = False
+context_dialogue_size = 8
+
+
+class WhisperTranscriber:
+    def __init__(self, model="small", device=None):
+        self.model = whisper.load_model(model, device=device)
+        self._buffer = ""
+
+    def transcribe(self, waveform):
+        """Transcribe audio using Whisper"""
+        # Pad/trim audio to fit 30 seconds as required by Whisper
+        audio = waveform.data.astype("float32").reshape(-1)
+        audio = whisper.pad_or_trim(audio)
+
+        # Transcribe the given audio while suppressing logs
+        with suppress_stdout():
+            transcription = whisper.transcribe(
+                self.model,
+                audio,
+                # We use past transcriptions to condition the model
+                initial_prompt=self._buffer,
+                verbose=True  # to avoid progress bar
+            )
+
+        return transcription
+
+    def identify_speakers(self, transcription, diarization, time_shift):
+        """Iterate over transcription segments to assign speakers"""
+        speaker_captions = []
+        for segment in transcription["segments"]:
+
+            # Crop diarization to the segment timestamps
+            start = time_shift + segment["words"][0]["start"]
+            end = time_shift + segment["words"][-1]["end"]
+            dia = diarization.crop(Segment(start, end))
+
+            # Assign a speaker to the segment based on diarization
+            speakers = dia.labels()
+            num_speakers = len(speakers)
+            if num_speakers == 0:
+                # No speakers were detected
+                caption = (-1, segment["text"])
+            elif num_speakers == 1:
+                # Only one speaker is active in this segment
+                spk_id = int(speakers[0].split("speaker")[1])
+                caption = (spk_id, segment["text"])
+            else:
+                # Multiple speakers, select the one that speaks the most
+                max_speaker = int(np.argmax([
+                    dia.label_duration(spk) for spk in speakers
+                ]))
+                caption = (max_speaker, segment["text"])
+            speaker_captions.append(caption)
+
+        return speaker_captions
+
+    def __call__(self, diarization, waveform):
+        # Step 1: Transcribe
+        transcription = self.transcribe(waveform)
+        # Update transcription buffer
+        self._buffer += transcription["text"]
+        # The audio may not be the beginning of the conversation
+        time_shift = waveform.sliding_window.start
+        # Step 2: Assign speakers
+        speaker_transcriptions = self.identify_speakers(
+            transcription, diarization, time_shift)
+        return speaker_transcriptions
+
+
+# Implement retries with exponential backoff
+def requests_retry_session(
+        retries=3,
+        backoff_factor=0.3,
+        status_forcelist=(500, 502, 504),
+        session=None,
+):
+    print("requests_retry_session")
+    session = session or requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+def update_caller_log(role, message):
+    print("update_caller_log")
+    global phone_number
+    file_name = f"{phone_number}.txt"
+    with open(file_name, "a", encoding="utf-8") as file:
+        file.write(f"{role}: {message}\n\n")
+
+
+def read_tars_txt():
+    print("read_tars_txt")
+    with open("TARS.txt", "r", encoding="utf-8") as file:
+        tars_txt = file.read()
+        return tars_txt
+
+
+def preprocess_input(user_input):
+    print("preprocess_input")
+    global identity, caller_name
+    tars_txt = read_tars_txt()
+    preprocessed_input = tars_txt + "\n" + caller_name + \
+        ": " + user_input + "\n" + identity + ":"
+    return preprocessed_input
+
+
+def post_process_response(response):
+    print("post_process_response")
+    global identity
+    response = re.sub(r'\n{identity}:', '', response).strip()
+    return response
+
+
+def update_summary():
+    print("update_summary")
+    global phone_number, caller_name
+    file_name = f"{phone_number}.txt"
+    with open(file_name, "r", encoding="utf-8") as file:
+        content = file.read()
+    # Find the start of the conversation
+    conversation_start = content.find("Dialogue:")
+    # Extract the conversation part
+    conversation = content[conversation_start:]
+    # Remove any duplicate "Dialogue:" lines
+    conversation = conversation.replace("Dialogue:\n\nDialogue:", "Dialogue:")
+    with open("Summarizer prompt.txt", "r", encoding="utf-8") as file:
+        prompt = file.read()
+    summary = generate_text(prompt, model="gpt-3.5-turbo")  # Generate summary
+    # Extract the name field
+    name_start = content.find("Person's name:") + len("Person's name:")
+    name_end = content.find("\n\n", name_start)
+    existing_name = content[name_start:name_end].strip()
+    # Generate name only if it is not already recorded
+    if not existing_name or existing_name == 'User':
+        caller_name = generate_text("SYSTEM MESSAGE: The previous text contain information about the conversation with the user. What is the user's name? Only write the user's name. If you do not know, write 'User'",
+                                    model="gpt-3.5-turbo")  # Generate name
+    else:
+        caller_name = existing_name
+    # Update the content with the new summary
+    new_content = "Phone number: " + phone_number + "\n\nPerson's name: " + caller_name + \
+        "\n\nSummary of the user: " + summary + "\n\nDialogue:\n\n" + conversation
+
+    with open(file_name, "w", encoding="utf-8") as file:
+        file.write(new_content)
+
+# Define a function to generate text using ChatGPT API
+
+
+def generate_text(prompt, model="gpt-3.5-turbo", temperature=1, max_tokens=200,
+                  stop_sequence=["User:", "USER:", f"{caller_name}:"]):
+    print("generate_text")
+    global phone_number, identity, caller_name, context_dialogue_size
+
+    if "tars" in prompt.lower():
+        identity = "TARS"
+        prompt = prompt.replace("tars", "TARS")
+    if "rick" in prompt.lower():
+        identity = "Rick Sanchez"
+    if "jarvis" in prompt.lower():
+        identity = "Jarvis"
+    if "morty" in prompt.lower():
+        identity = "Morty"
+    if "eric" in prompt.lower():
+        identity = "Eric"
+    if "jakob" in prompt.lower() or "jacob" in prompt.lower():
+        identity = "Jakob"
+    print('generating text')
+    start_time = time.time()
+    # Open the file in read mode
+    file_name = f"{identity}.txt"
+    with open(file_name, 'r', encoding="utf-8") as file:
+        # Read the contents of the file into a string
+        system_message = file.read()
+
+    # Open the file in read mode
+    file_name = f"{phone_number}.txt"
+    # Check if the file exists, if not, create it with initial content
+    if not os.path.exists(file_name):
+        with open(file_name, "w", encoding="utf-8") as file:
+            file.write(
+                f"Person's name: User\n\nSummary of the user: None so far\n\nDialogue:\n\n")
+        messages = [{"role": "system",
+                     "content": system_message + "\n\n" + prompt}]
+    else:
+        # Open the file in read mode
+        with open(file_name, 'r', encoding="utf-8") as file:
+            # Read the contents of the file into a string
+            contents = file.read()
+
+        # Extract the summary
+        summary_start = contents.find(
+            "Summary of the user:") + len("Summary of the user:")
+        summary_end = contents.find("\n\n", summary_start)
+        summary = contents[summary_start:summary_end].strip()
+
+        # Extract the last X lines
+        dialogue_lines = contents.split("\n")
+        # Get the last X lines
+        context_lines = dialogue_lines[-context_dialogue_size:]
+        context_dialogue = "\n".join(context_lines)
+
+        prompt = str(prompt)
+
+        # Create the initial message
+        messages = [{"role": "system",
+                     "content": "SYSTEM:\n" + system_message + "\n\n" + "SUMMARY OF CONVERSATION:\n" + summary + "\n\n" + "PREVIOUS " + str(
+                         context_dialogue_size) + " DIALOGUE TURNS:\n" + context_dialogue + "\n\n" + "THE CURRENT PROMPT: " + prompt}]
+
+    print(messages)
+
+    # Generate the response
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stop=stop_sequence
+    )
+
+    generated_text = response["choices"][0]["message"]["content"].strip()
+    try:
+        generated_text = json.loads(generated_text)
+        # print(search)
+    except json.JSONDecodeError:
+        pass
+    if generated_text.startswith(f"{identity}: "):
+        # If it does, remove the "TARS: " prefix
+        generated_text = generated_text[6:]
+    print(generated_text)
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f'Time taken: {elapsed_time} seconds')
+    return generated_text
+
+
+def text_to_speech(text):
+    print("text_to_speech")
+    global identity
+    print('generating audio')
+    start_time = time.time()
+    # Load voice settings from JSON file
+    with open("voice_settings.json", "r", encoding="utf-8") as file:
+        voice_settings_dict = json.load(file)
+    # Check if voice settings are available for the given identity
+    if identity in voice_settings_dict:
+        voice_settings = voice_settings_dict[identity]
+    else:
+        # If no voice settings are found, use default settings
+        voice_settings = {
+            "stability": 0.02,
+            "similarity_boost": 1.0,
+            "speed": 2.0,
+            "pitch": 1.0,
+            "volume": 2.0,
+            "emotion": "neutral"
+        }
+    # Set voice_id based on the identity
+    voice_ids = {
+        "TARS": "21m00Tcm4TlvDq8ikWAM",
+        "Rick Sanchez": "FJ2I6UDPb5m9Kfa5LPRs",
+        "Jarvis": "4NlGluLX1wBygO1loFkq",
+        "Morty": "Ghra0IROImNCWkuqOWUT",
+        "Eric": "K2JM3RULuXgydaFX6iPA",
+        "Jakob": "5DIr1Rkpc3Z7AIqujJyd"
+    }
+    voice_id = voice_ids.get(identity)
+    data = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": voice_settings
+    }
+    # /stream?optimize_streaming_latency=4
+    url = f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}'
+    # Send text and get audio data with voice settings
+    headers = {
+        "Content-Type": "application/json",
+        "xi-api-key": xi_api_key
+    }
+    # Use try/except block to handle errors
+    try:
+        response = requests_retry_session().post(url.format(
+            voice_id=voice_id), headers=headers, json=data, timeout=10)
+        response.raise_for_status()  # Raise an exception if status code is not 200
+        audio_data = response.content
+    except requests.exceptions.RequestException as e:  # Catch any request-related error
+        print(f"An error occurred: {e}")  # Print the error message
+        audio_data = None
+
+    if audio_data is None:
+        # Handle the case where no audio data was returned (e.g., return an error message or use a default audio file)
+        pass
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f'Time taken: {elapsed_time} seconds')
+    response_ready = True
+    cache['random_audio_played'] = True
+    # convert_audio(audio_data,'mp3')
+    return audio_data
+
+
+@app.route("/", methods=["GET"])
+def index():
+    print("index")
+    return "TARS phone system is running"
+
+
+socketio = SocketIO(app)
+
+
+# Constants
+threshold_size = 1024 * 1024  # 1 MB (adjust as needed)
+batch_duration = 5  # 5 seconds (adjust as needed)
+output_directory = 'audio_batches'  # Directory to store audio batches
+
+# Create the output directory if it doesn't exist
+os.makedirs(output_directory, exist_ok=True)
+
+audio_data_accumulator = bytearray()
+last_audio_data_time = time.time()
+
+
+async def process_audio_batch(audio_data):
+    # Define the filename and the format (e.g., WAV)
+    filename = "audio_output.wav"
+
+    # Assuming the audio data is in PCM format
+    with wave.open(filename, 'wb') as wav_file:
+        # Set the audio parameters
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # Sample width in bytes
+        wav_file.setframerate(16000)  # Sample rate in Hz
+
+        # Write the audio data
+        wav_file.writeframes(audio_data)
+
+    # Clear the accumulator after processing
+    audio_data.clear()
+
+    print(f"Saved audio batch to {filename}")
+
+
+# async def audio_stream(websocket, path):
+#     print("Starting async audio stream")
+
+#     last_audio_data_time = time.time()  # Initialize the last_audio_data_time
+#     print(type(websocket))
+
+#     async for message in websocket:
+#         print(type(message))
+#         if isinstance(message, bytes):
+#             print("receiving in is instance")
+#             audio_data_accumulator.extend(message)
+#             if len(audio_data_accumulator) > threshold_size:
+#                 await process_audio_batch(audio_data_accumulator)
+#         elif isinstance(message, str):
+#             try:
+#                 # Try to parse message as JSON and extract Base64 string
+#                 message_json = json.loads(message)
+#                 payload_audio = message_json.get("audio_data", "")
+#                 print("parsing in json")
+#             except json.JSONDecodeError:
+#                 # If not JSON, assume it's a direct Base64 string
+
+#                 print("assuming it is a direct base64 string")
+
+#             # Decode Base64 string to get binary data
+#             try:
+#                 audio_data = base64.b64decode(payload_audio)
+#                 audio_data_accumulator.extend(audio_data)
+#                 print("decoding base64 ")
+#             except base64.binascii.Error as e:
+#                 print(f"Error decoding Base64 audio: {e}")
+
+#             # print("Received a text message:", message)
+#             # print("Received a text message:", message)
+
+#         # Check if 5 seconds have elapsed
+#         current_time = time.time()
+#         if current_time - last_audio_data_time >= batch_duration:
+#             print("5 seconds have elapsed")
+#             if len(audio_data_accumulator) > 0:
+#                 await process_audio_batch(audio_data_accumulator)
+#             last_audio_data_time = current_time
+
+
+async def create_audio_file(audio_data, audio_file_count):
+    # Replace with the actual format parameters of your audio data
+    channels = 1
+    sample_width = 2
+    frame_rate = 8000
+    file_name = "output_audio"+str(audio_file_count)+".wav"
+
+    # Convert µ-law to PCM
+    pcm_data = audioop.ulaw2lin(audio_data, sample_width)
+
+    with wave.open(file_name, 'wb') as wave_file:
+        wave_file.setnchannels(channels)
+        wave_file.setsampwidth(sample_width)
+        wave_file.setframerate(frame_rate)
+        wave_file.writeframes(pcm_data)
+
+    print(f"Audio file '{file_name}' created.")
+
+    print("transcribed")
+    return file_name
+
+
+async def transcribe_audio(filename, model):
+    # Implement the logic to transcribe the audio file
+    result = model.transcribe(filename)
+    return result["text"]
+
+
+async def append_transcription_to_file(transcription, transcription_file):
+    with open(transcription_file, "a") as file:
+        file.write(transcription + "\n")
+
+
+async def send_audio_file(websocket, audio_file, stream_sid, chunk_counter):
+    # Check if the audio file exists
+    if not os.path.exists(audio_file):
+        print(f"Audio file {audio_file} does not exist.")
+        return chunk_counter
+
+    # Read audio file and convert to base64
+    try:
+        with open(audio_file, 'rb') as file:
+            audio_data = file.read()
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+    except Exception as e:
+        print(f"Error reading or encoding the audio file: {e}")
+        return chunk_counter
+
+    # # Create the media message
+    # media_message = {
+    #     "event": "media",
+    #     "sequenceNumber": str(chunk_counter),
+    #     "media": {
+    #         "track": "outbound",
+    #         "chunk": str(chunk_counter),
+    #         "timestamp": str(time.time() * 1000),  # Current time in milliseconds
+    #         "payload": audio_base64
+    #     },
+    #     "streamSid": stream_sid
+    # }
+
+     # Create the media message
+    media_message = {
+        "event": "media",
+        "streamSid": stream_sid,
+        "media": {
+            "payload": audio_base64
+        }
+
+    }
+
+    # Send the media message as JSON
+    try:
+        await websocket.send(json.dumps(media_message))
+        print(f"Sent audio chunk {chunk_counter}.")
+        print("stream sid is ", stream_sid)
+        # print("chunk is ", chunk_counter)
+
+        # print("Outgoing type of sequenceNumber is ", type(media_message['sequenceNumber']))
+        # print("Outgoing type of chunk is ", type(media_message['media']['chunk']))
+        # print("Outgoing type of timeStamp is ", type(media_message['media']['timestamp']))
+        # print("Outgoing type of payload is ", type(media_message['media']['payload']))
+        # print("Outgoing type of stream sid is ", type(media_message['streamSid']))
+
+        with open("twillio_outgoing_messages.txt", "a") as file:
+            file.write(json.dumps(media_message) + "\n")
+
+    except Exception as e:
+        print(f"Error sending audio data over WebSocket: {e}")
+
+    return chunk_counter + 1  # Increment and return the new counter
+
+
+async def process_audio_batch(audio_data_accumulator, last_audio_data_time, audio_file_count, websocket, stream_sid, chunk_counter, model, transcription_file, batch_duration):
+    # nonlocal audio_data_accumulator
+    # nonlocal last_audio_data_time
+    # nonlocal audio_file_count  # Use the outer variable
+
+    while True:
+        await asyncio.sleep(1)  # Check every 1 second
+        current_time = time.time()
+        if (current_time - last_audio_data_time >= batch_duration):
+            print("Greater than batch duration or size threshold reached.")
+            print("Length of audio data accumulator is ",
+                  len(audio_data_accumulator))
+            if len(audio_data_accumulator) > 0:
+                print("Starting process audio batch")
+                audio_filename = await create_audio_file(audio_data_accumulator, audio_file_count)
+                transcription = await transcribe_audio(audio_filename)
+                await append_transcription_to_file(transcription, transcription_file)
+                chunk_counter = await send_audio_file(websocket, "output_testing.wav", stream_sid, chunk_counter)
+
+                audio_data_accumulator = bytearray()  # Clear the accumulator
+
+            audio_file_count += 1  # Increment the audio file count
+            last_audio_data_time = current_time
+
+
+async def audio_stream(websocket, path):
+    print("Starting async audio stream")
+
+    audio_data_accumulator = bytearray()
+    last_audio_data_time = time.time()  # Initialize the last_audio_data_time
+    threshold_size = 10000  # Threshold size in bytes
+    batch_duration = 5  # Batch duration in seconds
+    audio_file_count = 0
+    transcription_file = "transcriptions.txt"  # File to store transcriptions
+    model = whisper.load_model("base")  # Load Whisper model
+
+    stream_sid = None  # Variable to store streamSid
+    chunk_counter = 1  # Initialize chunk counter
+    sequence_number = 0
+
+    # #Start the process_audio_batch task
+    # asyncio.create_task(process_audio_batch(audio_data_accumulator, last_audio_data_time, audio_file_count,
+    #                                         websocket, stream_sid, chunk_counter, model, transcription_file, batch_duration))
+
+    try:
+        async for message in websocket:
+            # print("type of message is ", type(message))
+            # print("message is ", message)
+            with open("twillio_messages.txt", "a") as file:
+                file.write(message + "\n")
+            sequence_number = sequence_number+1
+            if isinstance(message, bytes):
+                audio_data_accumulator.extend(message)
+            elif isinstance(message, str):
+                message_json = json.loads(message)
+                # Check if 'media' key exists and extract 'payload' from it
+
+                if message_json['event'] == "start":
+                    stream_sid = message_json['streamSid']
+                    print(f"Stream SID: {stream_sid}")
+
+                if 'media' in message_json and 'payload' in message_json['media'] and message_json['media']['track'] == "inbound":
+                    payload_audio = message_json['media']['payload']
+
+                    # Decode Base64 string to get binary data
+                    try:
+                        audio_data = base64.b64decode(payload_audio)
+                        audio_data_accumulator.extend(audio_data)
+
+                        # # Decode Base64 and convert µ-law to PCM
+                        # ulaw_data = base64.b64decode(payload_audio)
+                        # pcm_data = audioop.ulaw2lin(
+                        #     ulaw_data, 2)  # 2 for 16-bit PCM
+
+                        # # Resample audio if necessary (to 16kHz for IBM Watson)
+                        # resampled_audio = audioop.ratecv(
+                        #     pcm_data, 2, 1, 8000, 16000, None)[0]
+
+                        # # Debugging: Check the size of the audio data
+                        # # Debugging: Check the size of the audio data
+                        # print("Size of resampled audio data: {", len(
+                        #     resampled_audio), "} bytes")
+
+                        # # Make sure there's enough data
+                        # if len(resampled_audio) >= 100:
+                        #     audio_buffer = io.BytesIO(resampled_audio)
+                        #     audio_source = AudioSource(audio_buffer)
+
+                        #     # Test 1: Check the length of the buffer
+                        #     buffer_length = len(audio_buffer.getvalue())
+                        #     print("Length of audio buffer:", buffer_length)
+
+                        #     # Test: Check if the AudioSource is initialized properly
+                        #     # This will depend on the methods and properties available in AudioSource
+                        #     if hasattr(audio_source, 'length'):
+                        #         print("Length of audio source:",
+                        #               audio_source.length)
+                        #     else:
+                        #         print(
+                        #             "AudioSource does not have a length attribute.")
+
+                        #     # IBM Watson transcription
+                        #     # ... Watson API call ...
+
+                       # If payload_audio is a Base64 string
+                        # Decode if it's a Base64 string
+                        if isinstance(payload_audio, str):
+                            print("instance of str")
+                            payload_audio = base64.b64decode(payload_audio)
+
+                        audio_stream = io.BytesIO(payload_audio)
+
+                        # Create an AudioSource instance
+                        audio_source = AudioSource(audio_stream)
+
+                        speech_to_text.recognize_using_websocket(audio=audio_source,
+                                                                 content_type='audio/mulaw;rate=8000',
+                                                                 recognize_callback=mycallback,
+                                                                 model='en-US_NarrowbandModel',
+                                                                 interim_results=True)
+                        # else:
+                        #     print("Not enough audio data for transcription")
+
+                        # Create an in-memory buffer with the PCM data
+                        # audio_buffer = io.BytesIO(resampled_audio)
+                        # audio_source = AudioSource(audio_buffer)
+
+                    except base64.binascii.Error as e:
+                        print(f"Error decoding Base64 audio: {e}")
+                else:
+                    payload_audio = ""  # Or handle this case differently
+
+            # # Processing audio in batches
+            # current_time = time.time()
+            # if current_time - last_audio_data_time >= batch_duration:
+            #     print("Processing audio batch")
+            #     if len(audio_data_accumulator) > 0:
+            #         audio_filename = await create_audio_file(audio_data_accumulator, audio_file_count)
+            #         transcription = await transcribe_audio(audio_filename, model)
+            #         await append_transcription_to_file(transcription, transcription_file)
+            #         chunk_counter = await send_audio_file(websocket, "output_testing.wav", stream_sid, chunk_counter)
+            #         audio_data_accumulator = bytearray()
+            #     audio_file_count += 1
+            #     last_audio_data_time = current_time
+
+    except asyncio.CancelledError:
+        # WebSocket closed
+        pass
+
+    # # Outside of the async for loop, indicating WebSocket closure
+    #     if len(audio_data_accumulator) > 0:
+    #         print("WebSocket closed. Processing accumulated audio data.")
+    #         await create_audio_file(audio_data_accumulator, audio_file_count)
+
+
+async def write_to_file(text, filename="transcriptions.txt"):
+    with open(filename, "a") as file:
+        file.write(text + "\n")
+
+
+@app.route("/incoming_call", methods=["GET", "POST"])
+def incoming_call():
+    print("Starting incoming call")
+    resp = VoiceResponse()
+
+    # Specify your WebSocket server URL here
+    url = get_ngrok_url()
+    print("ngrok url is "+url)
+
+    localtunnel_url = get_saved_localtunnel_url()
+
+    websocket_url = 'wss://' + \
+        localtunnel_url.split('://')[-1] + '/audio_stream'
+    print("websocket url is "+websocket_url)
+
+    # Using Connect verb for bi-directional audio streaming
+    connect = Connect()
+    connect.stream(url=websocket_url)
+    resp.append(connect)
+
+    resp.say("Please start speaking after the beep.")
+    resp.pause(100000)
+    print(str(resp))
+
+    with open("twilio_response_str.txt", 'w') as file:
+        file.write(str(resp))
+
+    return str(resp)
+
+
+def process_batch(batch, batch_index):
+    """
+    Process the given batch of audio chunks.
+    This example function saves the batch as a single WAV file.
+
+    :param batch: List of audio chunks (bytes).
+    :param batch_index: The index of the batch (to create unique filenames).
+    """
+    filename = f"batch_{batch_index}.wav"
+    filepath = os.path.join('path/to/save', filename)
+
+    # Assuming the audio chunks are in PCM format with a sample rate of 16000 Hz and 1 channel (mono audio)
+    sample_rate = 16000
+    channels = 1
+    sample_width = 2  # 2 bytes per sample for PCM16
+
+    with wave.open(filepath, 'wb') as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(sample_width)
+        wav_file.setframerate(sample_rate)
+        for chunk in batch:
+            wav_file.writeframes(chunk)
+
+    print(f"Saved batch {batch_index} to {filename}")
+
+
+@contextmanager
+def suppress_stdout():
+    # Auxiliary function to suppress Whisper logs (it is quite verbose)
+    # All credit goes to: https://thesmithfam.org/blog/2012/10/25/temporarily-suppress-console-output-in-python/
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+
+
+# @app.route("/handle_incoming_input", methods=["POST"])
+# def handle_incoming_input():
+#     print("handle_incoming_input")
+#     global identity, caller_name, response_ready, phone_number
+#     print(f"Request data: {request.data}")
+#     print(f"Request values: {request.values}")
+#     print(f"Request headers: {request.headers}")
+#     try:
+#         recording_url = request.form.get("RecordingUrl")
+#         print(f"RecordingUrl: {recording_url}")
+
+#         if recording_url:
+#             # User has finished speaking, process the recording
+#             print("Processing recording")
+#             recording_response = requests_retry_session().get(recording_url, timeout=10)
+#             recording_data = recording_response.content
+#             transcript = speech_to_text(recording_data)
+#             transcript = transcript['text']
+
+#             def generate_response(cache):
+#                 global response_ready, phone_number
+#                 gpt_response = generate_text(transcript)
+#                 with open(f"{phone_number}.txt", "a", encoding="utf-8") as file:
+#                     file.write(
+#                         f"{caller_name}: {transcript}\n\n{identity}: {gpt_response}\n\n")
+#                 update_summary()
+#                 if "{hangup}" in gpt_response:
+#                     gpt_response = gpt_response.replace("{hangup}", "").strip()
+#                     audio_response = text_to_speech(gpt_response)
+#                     with open("audio_response.mp3", "wb") as f:
+#                         f.write(audio_response)
+#                     response_ready = True
+#                     response = "<Response><Hangup /></Response>"
+#                 else:
+#                     audio_response = text_to_speech(gpt_response)
+#                     with open("audio_response.mp3", "wb") as f:
+#                         f.write(audio_response)
+#                     response_ready = True
+#                 cache['random_audio_played'] = True
+
+#             session['random_audio_played'] = False
+#             threading.Thread(target=generate_response, args=(cache,)).start()
+#             response_ready = False
+#             response = f"<Response><Redirect method='POST'>/wait_for_response</Redirect></Response>"
+#         else:
+#             # No recording received, request the user to speak again
+#             print("Processing speech")
+#             audio_response = text_to_speech(
+#                 "Sorry, I didn't catch that. Please try again.")
+#             with open("audio_response.mp3", "wb") as f:
+#                 f.write(audio_response)
+#             response = f"<Response><Play>/audio_response.mp3</Play><Record action='/handle_incoming_input' maxLength='60' timeout='5' playBeep='false' /></Response>"
+#             print(f"Generated response: {response}")
+
+#     except Exception as e:
+#         print(f"Error: {e}")
+#         text = generate_text(
+#             "THIS IS A SYSTEM MESSAGE: You could not hear what they said, ask them to repeat. Make it short for the phone call. A few words only.")
+#         audio_response = text_to_speech(text)
+#         with open("audio_response.mp3", "wb") as f:
+#             f.write(audio_response)
+#         response = f"<Response><Play>/audio_response.mp3</Play><Record action='/handle_incoming_input' maxLength='60' timeout='5' playBeep='false' /></Response>"
+
+#     return response
+
+
+@app.route("/wait_for_response", methods=["GET", "POST"])
+def wait_for_response():
+    print("wait_for_response")
+    global response_ready, cache
+    # Set the path to the audio files folder
+    audio_folder = 'audio_files'
+    # Use the updated list of audio files with simpler names
+    audio_files = ['audio1.mp3', 'audio2.mp3', 'audio3.mp3']
+    # Choose a random MP3 file from the list
+    random_audio_file = random.choice(audio_files)
+
+    print(f"Random audio file chosen: {random_audio_file}")  # Debug print
+
+    if not cache.get('random_audio_played', False):
+        cache['random_audio_played'] = True
+        response = "<Response><Play>/audio_files/" + random_audio_file + \
+            "</Play><Redirect method='POST'>/wait_for_response</Redirect></Response>"
+
+        print("Playing random audio")  # Debug print
+    elif response_ready:
+        response = f"<Response><Play>/audio_response.mp3</Play><Record action='/handle_incoming_input' maxLength='60' timeout='5' playBeep='false'/></Response>"
+        print("Playing TARS-generated audio")  # Debug print
+    else:
+        response = f"<Response><Pause length='1'/><Redirect method='POST'>/wait_for_response</Redirect></Response>"
+        print("Waiting for response_ready")  # Debug print
+
+    return response
+
+
+@app.route("/process_response", methods=["GET", "POST"])
+def process_response():
+    print("process_response")
+    global cache
+    cache['random_audio_played'] = False
+    response = f"<Response><Play>/audio_response.mp3</Play><Record action='/handle_incoming_input' maxLength='60' timeout='5' playBeep='false' /></Response>"
+    return response
+
+
+@app.route('/audio_files/<path:filename>', methods=['GET', 'POST'])
+def audio_files(filename):
+    print("audio_files")
+    return send_from_directory('audio_files', filename)
+
+
+@app.route("/audio_response.mp3", methods=["GET"])
+def audio_response():
+    print("audio_response")
+    try:
+        # Load the audio file
+        input_file = "audio_response.mp3"
+        gain_increase = 10
+        audio = AudioSegment.from_file(input_file, format="mp3")
+        # Apply the gain increase
+        audio_with_gain = audio + gain_increase
+        # Export the modified audio to a byte stream
+        audio_stream = io.BytesIO()
+        audio_with_gain.export(audio_stream, format="mp3")
+        audio_data = audio_stream.getvalue()
+        # Create the response
+        response = make_response(audio_data)
+        response.headers.set("Content-Type", "audio/mpeg")
+        response.headers.set("Content-Disposition",
+                             "attachment; filename=audio_response.mp3")
+        return response
+    except Exception as e:
+        return str(e)
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    print("webhook")
+    # Extract the JSON payload from the request
+    data = request.get_json()
+
+    # Get the relevant parameters from the JSON payload
+    account_sid = data.get("AccountSid")
+    event_sid = data.get("Sid")
+    parent_account_sid = data.get("ParentAccountSid")
+    timestamp = data.get("Timestamp")
+    level = data.get("Level")
+    payload_type = data.get("PayloadType")
+    payload = data.get("Payload")
+
+    # Log the received data
+    print(f"Account SID: {account_sid}")
+    print(f"Event SID: {event_sid}")
+    print(f"Parent Account SID: {parent_account_sid}")
+    print(f"Timestamp: {timestamp}")
+    print(f"Level: {level}")
+    print(f"Payload Type: {payload_type}")
+    print(f"Payload: {json.dumps(payload, indent=2)}")
+
+    # If the event's level is an error, ask TARS if the user is still there
+    if level == "Error":
+        print("Error event received, attempting to continue the conversation")
+        # Add this line to print error details
+        print(f"Error details: {json.dumps(payload, indent=2)}")
+        prompt = "Ask the user if they are still there."
+        gpt_response = generate_text(prompt)
+        audio_response = text_to_speech(gpt_response)
+        with open("audio_response.mp3", "wb") as f:
+            f.write(audio_response)
+        return redirect(url_for("handle_incoming_input"))
+
+    # Return a 200 OK response to acknowledge receipt of the webhook event
+
+    # Integrating with socketio.
+    socketio.emit('new_webhook_data', data)
+
+    return jsonify({"result": "OK"})
+
+
+def kill_processes_on_port(port):
+    """Terminate processes running on the specified port, excluding the current process and its parent."""
+    current_pid = os.getpid()  # Get the current process ID
+    parent_pid = os.getppid()  # Get the parent process ID
+
+    try:
+        command = ['lsof', '-t', '-i:{}'.format(port)]
+        pids = subprocess.check_output(command).decode(
+            'utf-8').strip().split('\n')
+        for pid in pids:
+            # Check if PID is not the current process's PID or the parent's PID
+            if pid and int(pid) != current_pid and int(pid) != parent_pid:
+                os.kill(int(pid), signal.SIGKILL)
+                print(f"Killed process {pid} on port {port}")
+    except subprocess.CalledProcessError:
+        pass
+    except Exception as e:
+        print(f"Error killing ngrok process: {e}")
+
+
+def kill_ngrok():
+    try:
+        # List processes running ngrok
+        command = ['pgrep', '-f', 'ngrok']
+        pids = subprocess.check_output(command).decode(
+            'utf-8').strip().split('\n')
+
+        for pid in pids:
+            if pid:  # Check if pid is not empty
+                # Politely ask the process to terminate
+                os.kill(int(pid), signal.SIGTERM)
+                print(f"Killed ngrok process {pid}")
+    except subprocess.CalledProcessError:
+        print("No ngrok instances found.")
+    except Exception as e:
+        print(f"Error killing ngrok process: {e}")
+
+# ... Your other imports and initializations
+
+
+global ngrok_url
+
+
+def start_ngrok():
+
+    kill_processes_on_port(8000)
+    kill_processes_on_port(5000)
+
+    kill_ngrok()
+    time.sleep(3)
+    ngrok_process = subprocess.Popen(["ngrok", "http", "8000"])
+    time.sleep(1)
+
+    ngrok_url = get_ngrok_url()
+    print(f"Public ngrok URL: {ngrok_url}")
+
+
+localtunnel_port = 8080
+
+
+def run_flask_app():
+    # Check if FLASK_INITIALIZED environment variable is set
+    if not os.environ.get('FLASK_INITIALIZED'):
+        start_ngrok()  # Call the start_ngrok function
+        # Set the environment variable
+        kill_processes_on_port(8080)
+        time.sleep(1)
+        os.environ['FLASK_INITIALIZED'] = 'True'
+        starting_localtunnel_url = start_localtunnel_and_save_url(
+            localtunnel_port)
+        print(" starting_localtunnel_url is ", starting_localtunnel_url)
+
+    public_url = get_ngrok_url()
+    print(f"Public ngrok URL: {public_url}")
+    localtunnel_url = get_saved_localtunnel_url()
+    print("localtunnel url is "+localtunnel_url)
+    phone_number_sid = "8PN2d5f84b47087753df2b0648e80be3fa4"
+    # phone_number = client.incoming_phone_numbers(phone_number_sid).update(sms_url=f"{public_url}/sms", voice_url=f"{public_url}/voice")
+
+    # Replace with the SID of your specific phone number
+    phone_number_sid = "SK9981340905e59767b1a479726d299ddd"
+
+    incoming_phone_number = client.incoming_phone_numbers(
+        phone_number_sid).fetch()
+
+    voice_url = incoming_phone_number.voice_url
+    sms_url = incoming_phone_number.sms_url
+
+    print(f"Voice URL: {voice_url}")
+    print(f"SMS URL: {sms_url}")
+
+    new_voice_url = public_url + "/incoming_call"
+    incoming_phone_number.update(voice_url=new_voice_url)
+
+    updated_phone_number = client.incoming_phone_numbers(
+        phone_number_sid).fetch()
+    print(f"Updated Voice URL: {updated_phone_number.voice_url}")
+
+    app.run(port=8000)
+
+
+def run_websocket_server():
+    # Set binary=True to receive data as bytes)
+    start_server = websockets.serve(
+        audio_stream, "localhost", 8080)
+    asyncio.get_event_loop().run_until_complete(start_server)
+    asyncio.get_event_loop().run_forever()
+
+
+def socket_websocket_server():
+    app.logger.setLevel(logging.DEBUG)
+    from gevent import pywsgi
+    from geventwebsocket.handler import WebSocketHandler
+
+    HTTP_SERVER_PORT = 8080
+    server = pywsgi.WSGIServer(
+        ('', HTTP_SERVER_PORT), app, handler_class=WebSocketHandler)
+    print("Server listening on: http://localhost:" + str(HTTP_SERVER_PORT))
+    server.serve_forever()
+
+
+def start_localtunnel_and_save_url(tunnel_port, file_path='localtunnel_url.txt'):
+    # Define the command to start localtunnel
+    command = ['lt', '--port', str(tunnel_port)]
+
+    # Redirect the output to a temporary file
+    with open('localtunnel_temp_output.txt', 'w') as temp_file:
+        process = subprocess.Popen(
+            command, stdout=temp_file, stderr=subprocess.STDOUT)
+
+    # Wait for a few seconds to let the process initialize and write the output
+    time.sleep(5)
+
+    # Regular expression pattern to match the localtunnel URL
+    url_pattern = re.compile(r'your url is: (https?://\S+)')
+
+    # Read the temporary file to extract the URL
+    with open('localtunnel_temp_output.txt', 'r') as temp_file:
+        print("searching")
+        for line in temp_file:
+            match = url_pattern.search(line)
+            if match:
+                url = match.group(1)
+                print("matched")
+                # Write the URL to the specified file
+                with open(file_path, 'w') as file:
+                    file.write(url)
+                print("Localtunnel URL written to file.")
+                return url
+
+    # Return None if no URL was found
+    return None
+
+
+def get_saved_localtunnel_url(file_path='localtunnel_url.txt'):
+    try:
+        with open(file_path, 'r') as file:
+            return file.read().strip()
+    except FileNotFoundError:
+        print("URL file not found. Have you started the LocalTunnel?")
+        return None
+
+
+if __name__ == '__main__':
+
+    flask_thread = Thread(target=run_flask_app)
+    flask_thread.start()
+
+    # # Run WebSocket server in the main thread
+
+    run_websocket_server()
+
+
+
+
+
+
+
+
+
+
+

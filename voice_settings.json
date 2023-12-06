@@ -1,0 +1,50 @@
+{
+  "TARS": {
+    "stability": 0.08,
+    "similarity_boost": 1.0,
+    "speed": 2.0,
+    "pitch": 1.0,
+    "volume": 2.0,
+    "emotion": "neutral"
+  },
+  "Rick Sanchez": {
+    "stability": 0.02,
+    "similarity_boost": 1.0,
+    "speed": 2.0,
+    "pitch": 0.8,
+    "volume": 2.0,
+    "emotion": "neutral"
+  },
+  "Jarvis": {
+    "stability": 0.2,
+    "similarity_boost": 1.0,
+    "speed": 2.0,
+    "pitch": 0.8,
+    "volume": 2.0,
+    "emotion": "neutral"
+  },
+  "Morty": {
+    "stability": 1.0,
+    "similarity_boost": 1.0,
+    "speed": 1.0,
+    "pitch": 1.0,
+    "volume": 1.0,
+    "emotion": "neutral"
+  },
+  "Eric": {
+    "stability": 0.02,
+    "similarity_boost": 1.0,
+    "speed": 3.0,
+    "pitch": 1.0,
+    "volume": 1.0,
+    "emotion": "neutral"
+  },
+  "Jakob": {
+    "stability": 0.2,
+    "similarity_boost": 1.0,
+    "speed": 3.0,
+    "pitch": 1.0,
+    "volume": 1.0,
+    "emotion": "neutral"
+  }
+}
